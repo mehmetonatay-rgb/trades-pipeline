@@ -3,7 +3,8 @@
 Idempotent upsert into two databases (Leads, Routes). The dedup key is `Place ID`:
 Notion has no unique constraint, so the script enforces it by querying before insert.
 On re-run, mutable fields are updated and `Status` is never overwritten (field-work
-progress is preserved). Requests are throttled to ~3/sec with exponential backoff on 429.
+progress is preserved). Requests are throttled to ~3/sec with exponential backoff on
+transient failures (429 rate limits, 5xx gateway/server errors, and network blips).
 """
 from __future__ import annotations
 
@@ -11,8 +12,12 @@ import os
 import time
 from typing import Optional
 
+import httpx
 from notion_client import Client
-from notion_client.errors import APIResponseError, HTTPResponseError
+from notion_client.errors import APIResponseError, HTTPResponseError, RequestTimeoutError
+
+# Transient HTTP statuses worth retrying — rate limit + gateway/server errors.
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 from .cluster import single_place_maps_url
 from .schemas import ClassifiedRecord, Cluster, PlaceRecord
@@ -33,7 +38,9 @@ class NotionLoader:
         self._last_call = 0.0
 
     def _call(self, fn, **kwargs):
-        """Throttle + retry with exponential backoff on HTTP 429."""
+        """Throttle + retry with exponential backoff on transient failures:
+        HTTP 429 (rate limit), 5xx (gateway/server errors like the 502s Notion
+        occasionally returns), and network timeouts/connection blips."""
         for attempt in range(self.max_retries):
             elapsed = time.monotonic() - self._last_call
             if elapsed < self.min_interval:
@@ -45,7 +52,14 @@ class NotionLoader:
             except (APIResponseError, HTTPResponseError) as exc:
                 status = getattr(exc, "status", None)
                 self._last_call = time.monotonic()
-                if status == 429 and attempt < self.max_retries - 1:
+                if status in _RETRYABLE_STATUS and attempt < self.max_retries - 1:
+                    time.sleep((2 ** attempt) * self.min_interval)
+                    continue
+                raise
+            except (RequestTimeoutError, httpx.TransportError) as exc:
+                # Network-level failure (timeout, connection reset) — retry.
+                self._last_call = time.monotonic()
+                if attempt < self.max_retries - 1:
                     time.sleep((2 ** attempt) * self.min_interval)
                     continue
                 raise
