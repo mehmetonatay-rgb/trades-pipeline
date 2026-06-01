@@ -93,7 +93,7 @@ src/
   schemas.py         # PlaceRecord + classified/cluster records
   fetch.py           # google + apify adapters, caching, dedup
   classify.py        # scoring + optional LLM
-  cluster.py         # DBSCAN + nearest-neighbour routing + maps URLs
+  cluster.py         # DBSCAN + nearest-neighbour + 2-opt routing + maps URLs
   notion_load.py     # idempotent upsert, dedup, throttling
   notion_setup.py    # one-time DB creation
   pipeline.py        # orchestrates + report + CLI

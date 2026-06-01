@@ -61,6 +61,43 @@ def _nearest_neighbor_order(
     return order
 
 
+def _two_opt(
+    order: list[int],
+    coords: dict[int, tuple[float, float]],
+    radius: float,
+) -> list[int]:
+    """Improve an open-path tour with 2-opt local search: repeatedly reverse the
+    segment between two edges whenever doing so shortens the total path, until no
+    improving move remains. The first stop (centroid entry point) is kept fixed.
+    Deterministic and dependency-free; typically trims the greedy NN tour by several %.
+    """
+    n = len(order)
+    if n < 4:
+        return order  # nothing to untangle on 3 or fewer stops
+
+    def d(a: int, b: int) -> float:
+        return _haversine_km(coords[a], coords[b], radius)
+
+    best = list(order)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(0, n - 2):          # i >= 0 keeps the start fixed
+            a, b = best[i], best[i + 1]
+            for j in range(i + 2, n):
+                c = best[j]
+                if j + 1 < n:              # interior edges (a,b) and (c,d)
+                    e = best[j + 1]
+                    delta = (d(a, c) + d(b, e)) - (d(a, b) + d(c, e))
+                else:                      # reversing the suffix: only edge (a,b) changes
+                    delta = d(a, c) - d(a, b)
+                if delta < -1e-9:
+                    best[i + 1 : j + 1] = best[i + 1 : j + 1][::-1]
+                    a, b = best[i], best[i + 1]
+                    improved = True
+    return best
+
+
 def _route_distance_km(order: list[int], coords: dict[int, tuple[float, float]], radius: float) -> float:
     return sum(
         _haversine_km(coords[order[i]], coords[order[i + 1]], radius)
@@ -148,7 +185,9 @@ def cluster_leads(kept: list[ClassifiedRecord], config: dict) -> list[Cluster]:
             final_groups.extend(_split_oversized(members, coords, cfg, radius))
 
         for seq, members in enumerate(final_groups):
+            # Greedy NN gives a decent starting tour; 2-opt then untangles it.
             order = _nearest_neighbor_order(members, coords, radius)
+            order = _two_opt(order, coords, radius)
             route_letter = chr(ord("A") + seq) if seq < 26 else f"Z{seq}"
             route_id = f"{district}-{route_letter}"
             ordered_place_ids = [recs[i].place_id for i in order]
