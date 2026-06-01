@@ -1,0 +1,9 @@
+httpx>=0.27
+notion-client>=2.2,<3   # pin to 2.x: classic database_id API; 3.x is data-sources-only
+scikit-learn>=1.4
+numpy>=1.26
+pandas>=2.2
+python-dotenv>=1.0
+pyyaml>=6.0
+# Optional — only needed for --llm-uncertain
+anthropic>=0.39

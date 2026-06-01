@@ -1,0 +1,153 @@
+# Trades Lead Pipeline — config. Everything tunable lives here; no logic is hardcoded.
+
+source: google            # google | apify
+
+districts:
+  - Kadıköy
+  - Üsküdar
+  - Şişli
+
+# Each trade: English `key`, Notion-friendly `label`, Turkish service-intent `query_terms`.
+# Rule: seed with service terms only — `elektrikçi`, never `elektrik malzemeleri`.
+trades:
+  - key: electrician
+    label: Elektrikçi
+    query_terms: [elektrikçi, elektrik ustası, elektrik tamiri, elektrik arıza]
+  - key: plumber
+    label: Su tesisatçısı
+    query_terms: [su tesisatçısı, tesisatçı, sıhhi tesisat, su kaçağı tespiti, tıkanıklık açma]
+  - key: hvac
+    label: Kombi/Doğalgaz
+    query_terms: [kombi servisi, doğalgaz tesisatı, petek temizleme]
+  - key: ac
+    label: Klima servisi
+    query_terms: [klima montaj, klima servisi, klima bakım]
+  - key: painter
+    label: Boyacı
+    query_terms: [boyacı, boya badana ustası]
+  - key: tiler
+    label: Fayansçı
+    query_terms: [fayansçı, seramik ustası]
+  - key: locksmith
+    label: Çilingir
+    query_terms: [çilingir, kapı açma]
+  - key: welder
+    label: Kaynakçı
+    query_terms: [kaynakçı, demir doğrama]
+  - key: appliance
+    label: Beyaz eşya servisi
+    query_terms: [beyaz eşya servisi, buzdolabı tamiri]
+
+# ---- Fetch ----
+fetch:
+  city: İstanbul              # appended to query: "<term> <district> <city>"
+  language_code: tr
+  region_code: TR
+  max_pages: 3               # Places New returns ~20/page, 3 pages = ~60 results
+  apify_actor: compass/crawler-google-places
+  max_results_per_search: 60
+
+# ---- Classify (Stage 3.3) ----
+# Scoring weights — tune until Service precision >= 85% on a hand-checked sample.
+classify:
+  weights:
+    allow_category: 2
+    block_category: -3
+    service_keyword: 1        # per match
+    service_keyword_cap: 2
+    supply_keyword: -2        # per match
+    supply_keyword_cap: -4
+    no_ecommerce_website: 1
+  thresholds:
+    keep: 2                   # score >= keep  -> Service
+    drop: -2                  # score <= drop  -> Supply
+
+  allow_categories:           # primary_type / type_display / types
+    - electrician
+    - plumber
+    - hvac_contractor
+    - general_contractor
+    - roofing_contractor
+    - painter
+    - locksmith
+    - appliance_repair_service
+    - contractor
+    - Elektrikçi
+    - Su tesisatçısı
+    - Tesisatçı
+    - Tamir servisi
+  # Google appends these generic catch-all types to nearly every listing — ignore
+  # them when category-matching so `store`/`establishment` don't falsely block.
+  generic_types:
+    - store
+    - point_of_interest
+    - establishment
+    - food
+    - finance
+
+  block_categories:
+    - hardware_store
+    - home_improvement_store
+    - electrical_supply_store
+    - plumbing_supply_store
+    - building_materials_supplier
+    - wholesaler
+    - store
+    - lighting_store
+    - do_it_yourself_store
+
+  supply_keywords:            # negative name signals
+    - malzeme
+    - malzemeleri
+    - market
+    - yapı market
+    - hırdavat
+    - nalbur
+    - nalburiye
+    - ticaret
+    - "tic."
+    - toptan
+    - bayi
+    - bayii
+    - sanayi
+    - "san."
+    - mağaza
+    - depo
+    - satış
+    - armatür
+  service_keywords:           # positive name signals
+    - usta
+    - ustası
+    - servis
+    - tesisat
+    - tamir
+    - montaj
+    - arıza
+    - çilingir
+    - kaçağı
+    - açma
+
+  # Domains that hint "this is a catalog/shop, not a tradesperson" (kills the no-website bonus).
+  ecommerce_domains:
+    - n11.com
+    - hepsiburada.com
+    - trendyol.com
+    - sahibinden.com
+    - gittigidiyor.com
+
+  llm:
+    model: claude-haiku-4-5-20251001
+    max_review_snippets: 2
+
+# ---- Cluster + route (Stage 3.4) ----
+cluster:
+  eps_km: 0.8
+  min_samples: 3
+  max_cluster_size: 12
+  earth_radius_km: 6371.0
+  maps_max_waypoints: 9       # google.com/maps/dir supports ~9 intermediate waypoints
+
+# ---- Notion (Stage 3.5) ----
+notion:
+  requests_per_sec: 3
+  max_retries: 5
