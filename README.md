@@ -52,7 +52,24 @@ python -m src.pipeline --refresh
 
 # add the cost-controlled LLM pass on the Uncertain band
 python -m src.pipeline --llm-uncertain
+
+# beat Google's ~60-result-per-query cap by grid-tiling each district (Google only)
+python -m src.pipeline --tile --district Kağıthane,Ümraniye
 ```
+
+### Grid-tiling (`--tile`)
+
+Google Places text search hard-caps at ~60 results per query, so dense districts
+come back truncated. `--tile` geocodes each district to its bounding box, searches
+each cell with a `locationRestriction` rectangle, and recursively quad-splits any
+cell that still hits the cap (`fetch.tiling` in config). Two things to know:
+
+- **Spillover:** a rectangle isn't district-shaped, so tiling also harvests
+  neighbouring-district businesses inside the bbox (~35% in practice). They're real
+  leads, correctly geocoded — just outside the named district.
+- **Cost:** issues many more API calls (a dense trade × district can be ~150+).
+  Tiled responses cache under a separate `googletiled_*` namespace, so re-runs are
+  free. The run prints the total searchText call count.
 
 ## How classification works (the heart of v1)
 

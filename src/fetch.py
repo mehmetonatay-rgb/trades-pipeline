@@ -106,7 +106,10 @@ class FetchAdapter(ABC):
         """Map one raw place dict into a PlaceRecord (or None to skip)."""
 
     def fetch(self, query: str, district: str, *, refresh: bool = False) -> list[PlaceRecord]:
-        path = _cache_path(self.source, district, query)
+        # Tiled runs cache under a separate namespace so they never collide with
+        # the (60-capped) plain-search cache from earlier runs.
+        namespace = getattr(self, "cache_namespace", self.source)
+        path = _cache_path(namespace, district, query)
         raw_items = None if refresh else _read_cache(path)
         if raw_items is None:
             raw_items = self.fetch_raw(query, district)
@@ -129,6 +132,15 @@ class GooglePlacesAdapter(FetchAdapter):
         self.cfg = fetch_cfg
         self.api_key = api_key or os.environ.get("GOOGLE_MAPS_API_KEY", "")
         self._geocode_cache: dict[tuple[float, float], tuple[str, str]] = {}
+        self._bounds_cache: dict[str, tuple[float, float, float, float]] = {}
+        tcfg = fetch_cfg.get("tiling", {}) or {}
+        self.tiling_enabled = bool(tcfg.get("enabled", False))
+        self.tile_grid = int(tcfg.get("grid", 2))            # NxN split per level
+        self.tile_max_depth = int(tcfg.get("max_depth", 3))  # recursion levels
+        self.tile_cap = int(tcfg.get("cap_threshold", 58))   # >= this => still truncated
+        self.search_count = 0                                 # for cost reporting
+        if self.tiling_enabled:
+            self.cache_namespace = "googletiled"
 
     def _client(self) -> httpx.Client:
         return httpx.Client(timeout=30.0)
@@ -159,10 +171,14 @@ class GooglePlacesAdapter(FetchAdapter):
             f"Google Places searchText exhausted retries for {text_query!r}: {last_detail}"
         )
 
-    def fetch_raw(self, query: str, district: str) -> list[dict]:
-        if not self.api_key:
-            raise RuntimeError("GOOGLE_MAPS_API_KEY is not set")
-        text_query = f"{query} {district} {self.cfg.get('city', '')}".strip()
+    def _search(
+        self,
+        client: httpx.Client,
+        text_query: str,
+        rect: Optional[tuple[float, float, float, float]] = None,
+    ) -> list[dict]:
+        """One paginated searchText, optionally restricted to a (lo_lat, lo_lng,
+        hi_lat, hi_lng) rectangle. Returns up to ~60 raw places."""
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": self.api_key,
@@ -173,17 +189,100 @@ class GooglePlacesAdapter(FetchAdapter):
             "languageCode": self.cfg.get("language_code", "tr"),
             "regionCode": self.cfg.get("region_code", "TR"),
         }
+        if rect is not None:
+            lo_lat, lo_lng, hi_lat, hi_lng = rect
+            body["locationRestriction"] = {
+                "rectangle": {
+                    "low": {"latitude": lo_lat, "longitude": lo_lng},
+                    "high": {"latitude": hi_lat, "longitude": hi_lng},
+                }
+            }
         places: list[dict] = []
         max_pages = int(self.cfg.get("max_pages", 3))
-        with self._client() as client:
-            for page in range(max_pages):
-                data = self._post(client, headers, body, text_query)
-                places.extend(data.get("places", []))
-                token = data.get("nextPageToken")
-                if not token:
-                    break
-                body["pageToken"] = token
+        for _ in range(max_pages):
+            self.search_count += 1
+            data = self._post(client, headers, body, text_query)
+            places.extend(data.get("places", []))
+            token = data.get("nextPageToken")
+            if not token:
+                break
+            body["pageToken"] = token
         return places
+
+    def _district_bounds(self, district: str) -> Optional[tuple[float, float, float, float]]:
+        """Authoritative bbox for a district via Geocoding (bounds, else viewport)."""
+        if district in self._bounds_cache:
+            return self._bounds_cache[district]
+        bounds = None
+        try:
+            with self._client() as client:
+                resp = client.get(
+                    GOOGLE_GEOCODE_URL,
+                    params={"address": f"{district}, {self.cfg.get('city','')}",
+                            "key": self.api_key, "language": "tr"},
+                )
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+                if results:
+                    geom = results[0].get("geometry", {})
+                    box = geom.get("bounds") or geom.get("viewport")
+                    if box:
+                        sw, ne = box["southwest"], box["northeast"]
+                        bounds = (sw["lat"], sw["lng"], ne["lat"], ne["lng"])
+        except Exception:
+            bounds = None
+        if bounds:
+            self._bounds_cache[district] = bounds
+        return bounds
+
+    @staticmethod
+    def _split_rect(rect: tuple[float, float, float, float], grid: int) -> list[tuple]:
+        lo_lat, lo_lng, hi_lat, hi_lng = rect
+        dlat = (hi_lat - lo_lat) / grid
+        dlng = (hi_lng - lo_lng) / grid
+        tiles = []
+        for r in range(grid):
+            for c in range(grid):
+                tiles.append((
+                    lo_lat + r * dlat, lo_lng + c * dlng,
+                    lo_lat + (r + 1) * dlat, lo_lng + (c + 1) * dlng,
+                ))
+        return tiles
+
+    def _tile_search(self, client, text_query, rect, depth, acc: dict) -> None:
+        """Recursive quad-tree: search a tile; if it still caps and we have depth
+        budget, split and recurse. Results merge into acc (dedup by place id)."""
+        places = self._search(client, text_query, rect)
+        for p in places:
+            if p.get("id"):
+                acc[p["id"]] = p
+        if len(places) >= self.tile_cap and depth < self.tile_max_depth:
+            for sub in self._split_rect(rect, self.tile_grid):
+                self._tile_search(client, text_query, sub, depth + 1, acc)
+                time.sleep(0.02)
+
+    def _tiled_fetch(self, query: str, district: str) -> list[dict]:
+        text_query = f"{query} {self.cfg.get('city', '')}".strip()  # district comes from the rectangle
+        bounds = self._district_bounds(district)
+        acc: dict[str, dict] = {}
+        with self._client() as client:
+            if bounds is None:
+                # Geocode failed — fall back to a plain district text search.
+                for p in self._search(client, f"{query} {district} {self.cfg.get('city','')}".strip()):
+                    if p.get("id"):
+                        acc[p["id"]] = p
+            else:
+                self._tile_search(client, text_query, bounds, 0, acc)
+        return list(acc.values())
+
+    def fetch_raw(self, query: str, district: str) -> list[dict]:
+        if not self.api_key:
+            raise RuntimeError("GOOGLE_MAPS_API_KEY is not set")
+        if self.tiling_enabled:
+            return self._tiled_fetch(query, district)
+        text_query = f"{query} {district} {self.cfg.get('city', '')}".strip()
+        with self._client() as client:
+            return self._search(client, text_query)
 
     def normalize(self, raw: dict, district: str, query: str) -> Optional[PlaceRecord]:
         loc = raw.get("location", {}) or {}
@@ -344,5 +443,8 @@ def run_fetch(
                                 existing.source_queries.append(q)
                 # be gentle with the API even when not cached
                 time.sleep(0.05)
+
+    if getattr(adapter, "tiling_enabled", False):
+        print(f"  (tiling: {adapter.search_count} searchText calls issued this run)")
 
     return list(by_id.values())

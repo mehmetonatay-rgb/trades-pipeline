@@ -47,6 +47,15 @@ fetch:
   apify_actor: compass/crawler-google-places
   max_results_per_search: 60
 
+  # Geographic grid-tiling (Google adapter). Google hard-caps text search at ~60
+  # results; tiling splits a district's bbox and searches each cell, recursing into
+  # cells that still cap, to get past the ceiling. Enable per-run with --tile.
+  tiling:
+    enabled: false
+    grid: 2              # NxN split per recursion level (2 = quad-tree)
+    max_depth: 3         # how many times a still-capped tile may be re-split
+    cap_threshold: 58    # a tile returning >= this is treated as truncated
+
 # ---- Classify (Stage 3.3) ----
 # Scoring weights — tune until Service precision >= 85% on a hand-checked sample.
 classify:

@@ -134,10 +134,14 @@ def main() -> None:
     parser.add_argument("--refresh", action="store_true", help="Ignore cache, re-hit the API")
     parser.add_argument("--no-notion", action="store_true", help="Dry run to data/ only")
     parser.add_argument("--llm-uncertain", action="store_true", help="LLM pass on Uncertain band")
+    parser.add_argument("--tile", action="store_true",
+                        help="Grid-tile each district's bbox to beat the 60-result cap (Google only)")
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
     config = load_config(Path(args.config))
+    if args.tile:
+        config.setdefault("fetch", {}).setdefault("tiling", {})["enabled"] = True
 
     districts = (
         [d.strip() for d in args.district.split(",")] if args.district else config["districts"]
